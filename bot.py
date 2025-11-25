@@ -333,16 +333,24 @@ async def api_settings(request):
       settings["currency_label"] = data["currency_label"]
       settings["currency_code"] = 5 if data["currency_label"] == "RUB" else 1
 
-    if data.get("language") in ["ru", "en"]:
-      settings["language"] = data["language"]
-
     interval_min = data.get("interval_min")
-    if isinstance(interval_min, int) and interval_min >= 5:
-      settings["interval_min"] = interval_min
+    try:
+      interval = int(interval_min)
+    except (TypeError, ValueError):
+      interval = settings.get("interval_min", 10)
+
+    if interval < 1:
+      interval = 1
+
+    settings["interval_min"] = interval
+
+    # language: always English
+    settings["language"] = "en"
 
     save_json(users_path, users)
 
   return web.json_response({ "ok": True })
+
 
 
 async def api_use(request):
