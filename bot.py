@@ -31,7 +31,7 @@ def load_json(path, default):
   try:
     with open(path, "r", encoding="utf-8") as f:
       return json.load(f)
-  except:
+  except Exception:
     return default
 
 
@@ -102,7 +102,7 @@ async def fetch_price(appid, hash_name, currency_code):
   digits = "".join(ch for ch in cleaned if ch.isdigit() or ch == ".")
   try:
     return float(digits)
-  except:
+  except Exception:
     return None
 
 
@@ -132,7 +132,7 @@ async def start_handler(message: types.Message):
 
   if not code:
     await message.answer(
-      "Привет! Нажми Start через ссылку из расширения 🙂"
+      "Hi! Press Start using the link from the browser extension 🙂"
     )
     return
 
@@ -144,7 +144,7 @@ async def start_handler(message: types.Message):
         break
 
     if not user:
-      await message.answer("Код недействителен или уже использован.")
+      await message.answer("Code is invalid or already used.")
       return
 
     user["tg_chat_id"] = message.chat.id
@@ -157,8 +157,8 @@ async def start_handler(message: types.Message):
     save_json(users_path, users)
 
   await message.answer(
-    "✅ Steam Track n Buy подключён.\n"
-    "Теперь уведомления будут приходить сюда."
+    "✅ Steam Track n Buy is now connected.\n"
+    "All alerts will be sent here."
   )
 
 
@@ -174,7 +174,7 @@ async def list_items_handler(message: types.Message):
 
     if not user:
       await message.answer(
-        "Сначала привяжи Telegram через расширение (Connect Telegram)."
+        "First link Telegram via the browser extension (Connect Telegram)."
       )
       return
 
@@ -183,7 +183,7 @@ async def list_items_handler(message: types.Message):
     cur = user["settings"]["currency_label"]
 
   if len(my_items) == 0:
-    await message.answer("У тебя пока нет отслеживаемых предметов.")
+    await message.answer("You don't have any tracked items yet.")
     return
 
   lines = []
@@ -192,16 +192,20 @@ async def list_items_handler(message: types.Message):
     last_price_str = "?" if last_price is None else f"{last_price} {cur}"
 
     direction = it.get("direction")
-    dir_str = "жду падения (buy)" if direction == "buy" else "жду роста (sell)"
+    dir_str = (
+      "waiting for price drop (buy)"
+      if direction == "buy"
+      else "waiting for price rise (sell)"
+    )
 
     lines.append(
       f"{i}. {it['hash_name']}\n"
-      f"   сейчас: {last_price_str}\n"
-      f"   цель: {it['target_price']} {cur}\n"
-      f"   режим: {dir_str}"
+      f"   now: {last_price_str}\n"
+      f"   target: {it['target_price']} {cur}\n"
+      f"   mode: {dir_str}"
     )
 
-  text = "📌 Твои отслеживаемые предметы:\n\n" + "\n\n".join(lines)
+  text = "📌 Your tracked items:\n\n" + "\n\n".join(lines)
   await message.answer(text)
 
 
@@ -211,7 +215,7 @@ async def healthz(request):
   return web.Response(text="ok")
 
 
-# регистрация: только tg_username + password
+# registration: tg_username + password
 async def api_register(request):
   data = await request.json()
 
@@ -230,8 +234,8 @@ async def api_register(request):
     token = secrets.token_hex(16)
 
     users.append({
-      "tg_login": tg_username,           # логин по @никнейму
-      "tg_username_real": None,          # реальный @ из Telegram
+      "tg_login": tg_username,
+      "tg_username_real": None,
       "salt": salt,
       "pw_hash": pw_hash,
       "token": token,
@@ -240,7 +244,7 @@ async def api_register(request):
       "settings": {
         "currency_label": "RUB",
         "currency_code": 5,
-        "language": "ru",
+        "language": "en",
         "interval_min": 10
       }
     })
@@ -250,7 +254,7 @@ async def api_register(request):
   return web.json_response({ "ok": True })
 
 
-# логин: tg_username + password
+# login: tg_username + password
 async def api_login(request):
   data = await request.json()
 
@@ -343,14 +347,11 @@ async def api_settings(request):
       interval = 1
 
     settings["interval_min"] = interval
-
-    # language: always English
     settings["language"] = "en"
 
     save_json(users_path, users)
 
   return web.json_response({ "ok": True })
-
 
 
 async def api_use(request):
@@ -366,7 +367,7 @@ async def api_use(request):
     chat_id = user.get("tg_chat_id")
 
   if chat_id:
-    text = f"🟦 Steam Track n Buy использовано: {action}"
+    text = f"🟦 Steam Track n Buy used: {action}"
     await tg_bot.send_message(chat_id, text)
 
   return web.json_response({ "ok": True })
@@ -431,16 +432,16 @@ async def api_track(request):
   if chat_id:
     cur = settings["currency_label"]
     advise = (
-      "цель ниже текущей — буду ждать падения цены."
+      "target is below current price — I will wait for the price to drop."
       if direction == "buy"
-      else "цель выше текущей — буду ждать роста цены."
+      else "target is above current price — I will wait for the price to rise."
     )
 
     text = (
-      f"✅ Добавлено в отслеживание:\n"
+      "✅ Added to tracking:\n"
       f"[{hash_name}]\n"
-      f"цена сейчас: {current_price} {cur}\n"
-      f"цель: {target_price} {cur}\n"
+      f"current price: {current_price} {cur}\n"
+      f"target: {target_price} {cur}\n"
       f"{advise}"
     )
     await tg_bot.send_message(chat_id, text)
@@ -535,16 +536,16 @@ async def polling_loop():
       if direction == "buy" and price_now <= target:
         it["last_notified_at"] = now
         text = (
-          f"[{it['hash_name']}] продается по "
-          f"[{price_now} {cur}] — быстрее покупай!"
+          f"[{it['hash_name']}] is now selling for "
+          f"[{price_now} {cur}] — hurry up and buy!"
         )
         await tg_bot.send_message(user["tg_chat_id"], text)
 
       if direction == "sell" and price_now >= target:
         it["last_notified_at"] = now
         text = (
-          f"[{it['hash_name']}] стал дороже до "
-          f"[{price_now} {cur}] — быстрее продавай!"
+          f"[{it['hash_name']}] just went up to "
+          f"[{price_now} {cur}] — hurry up and sell!"
         )
         await tg_bot.send_message(user["tg_chat_id"], text)
 
@@ -580,7 +581,6 @@ async def main():
   await site.start()
 
   asyncio.create_task(polling_loop())
-
   await dp.start_polling(tg_bot)
 
 
