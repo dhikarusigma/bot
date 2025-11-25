@@ -49,9 +49,9 @@ def hash_password(password, salt):
   return hashlib.sha256(s).hexdigest()
 
 
-def find_user_by_steam(steam_nick):
+def find_user_by_login(tg_username):
   for u in users:
-    if u["steam_nick"].lower() == steam_nick.lower():
+    if u["tg_login"].lower() == tg_username.lower():
       return u
   return None
 
@@ -106,8 +106,8 @@ async def fetch_price(appid, hash_name, currency_code):
     return None
 
 
-def make_item_id(appid, hash_name, steam_nick):
-  return f"{steam_nick}|{appid}|{hash_name}"
+def make_item_id(appid, hash_name, user_token):
+  return f"{user_token}|{appid}|{hash_name}"
 
 
 @web.middleware
@@ -123,7 +123,7 @@ async def cors_middleware(request, handler):
   return resp
 
 
-# ---------- TELEGRAM /start CODE pairing ----------
+# ---------- TELEGRAM /start ----------
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
@@ -132,7 +132,7 @@ async def start_handler(message: types.Message):
 
   if not code:
     await message.answer(
-      "Привет! Открой меня через ссылку из расширения 🙂"
+      "Привет! Нажми Start через ссылку из расширения 🙂"
     )
     return
 
@@ -150,7 +150,7 @@ async def start_handler(message: types.Message):
     user["tg_chat_id"] = message.chat.id
     user["tg_username_real"] = (
       "@" + message.from_user.username
-      if message.from_user.username else user["tg_username"]
+      if message.from_user.username else user["tg_login"]
     )
     user["pair_code"] = None
 
@@ -178,8 +178,8 @@ async def list_items_handler(message: types.Message):
       )
       return
 
-    steam_nick = user["steam_nick"]
-    my_items = [it for it in items if it["steam_nick"] == steam_nick]
+    user_token = user["token"]
+    my_items = [it for it in items if it["user_token"] == user_token]
     cur = user["settings"]["currency_label"]
 
   if len(my_items) == 0:
@@ -211,18 +211,18 @@ async def healthz(request):
   return web.Response(text="ok")
 
 
+# регистрация: только tg_username + password
 async def api_register(request):
   data = await request.json()
 
-  steam_nick = (data.get("steam_nick") or "").strip()
   tg_username = (data.get("tg_username") or "").strip()
   password = (data.get("password") or "").strip()
 
-  if len(steam_nick) < 2 or len(password) < 4 or not tg_username.startswith("@"):
+  if len(tg_username) < 2 or len(password) < 4 or not tg_username.startswith("@"):
     return web.json_response({ "ok": False, "error": "bad_input" })
 
   async with lock:
-    if find_user_by_steam(steam_nick):
+    if find_user_by_login(tg_username):
       return web.json_response({ "ok": False, "error": "exists" })
 
     salt = secrets.token_hex(8)
@@ -230,9 +230,8 @@ async def api_register(request):
     token = secrets.token_hex(16)
 
     users.append({
-      "steam_nick": steam_nick,
-      "tg_username": tg_username,
-      "tg_username_real": None,
+      "tg_login": tg_username,           # логин по @никнейму
+      "tg_username_real": None,          # реальный @ из Telegram
       "salt": salt,
       "pw_hash": pw_hash,
       "token": token,
@@ -251,14 +250,15 @@ async def api_register(request):
   return web.json_response({ "ok": True })
 
 
+# логин: tg_username + password
 async def api_login(request):
   data = await request.json()
 
-  steam_nick = (data.get("steam_nick") or "").strip()
+  tg_username = (data.get("tg_username") or "").strip()
   password = (data.get("password") or "").strip()
 
   async with lock:
-    user = find_user_by_steam(steam_nick)
+    user = find_user_by_login(tg_username)
 
     if not user:
       return web.json_response({ "ok": False, "error": "not_found" })
@@ -285,17 +285,16 @@ async def api_state(request):
     if not user:
       return web.json_response({ "ok": False, "error": "no_auth" })
 
-    steam_nick = user["steam_nick"]
-    my_items = [it for it in items if it["steam_nick"] == steam_nick]
+    user_token = user["token"]
+    my_items = [it for it in items if it["user_token"] == user_token]
 
     return web.json_response({
       "ok": True,
-      "steam_nick": steam_nick,
-      "tg_connected": bool(user.get("tg_chat_id")),
-      "tg_username": user.get("tg_username_real") or user.get("tg_username"),
+      "tg_username": user.get("tg_username_real") or user.get("tg_login"),
       "settings": user["settings"],
       "items": my_items,
-      "bot_username": bot_username
+      "bot_username": bot_username,
+      "tg_connected": bool(user.get("tg_chat_id"))
     })
 
 
@@ -378,8 +377,8 @@ async def api_track(request):
       return web.json_response({ "ok": False, "error": "no_auth" })
 
     settings = user["settings"]
-    steam_nick = user["steam_nick"]
     chat_id = user.get("tg_chat_id")
+    user_token = user["token"]
 
   if not appid or not hash_name or not target_price:
     return web.json_response({ "ok": False, "error": "bad_input" })
@@ -392,7 +391,7 @@ async def api_track(request):
   if target_price > current_price:
     direction = "sell"
 
-  item_id = make_item_id(appid, hash_name, steam_nick)
+  item_id = make_item_id(appid, hash_name, user_token)
 
   async with lock:
     exist = None
@@ -408,7 +407,7 @@ async def api_track(request):
     else:
       items.append({
         "id": item_id,
-        "steam_nick": steam_nick,
+        "user_token": user_token,
         "appid": appid,
         "hash_name": hash_name,
         "target_price": target_price,
@@ -455,11 +454,11 @@ async def api_untrack(request):
     if not user:
       return web.json_response({ "ok": False, "error": "no_auth" })
 
-    steam_nick = user["steam_nick"]
+    user_token = user["token"]
 
     new_items = []
     for it in items:
-      if it["id"] == item_id and it["steam_nick"] == steam_nick:
+      if it["id"] == item_id and it["user_token"] == user_token:
         continue
       new_items.append(it)
 
@@ -493,7 +492,7 @@ async def polling_loop():
 
       user = None
       for u in local_users:
-        if u["steam_nick"] == it["steam_nick"]:
+        if u["token"] == it["user_token"]:
           user = u
           break
 
