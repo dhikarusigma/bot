@@ -75,35 +75,71 @@ def now_sec():
 
 
 async def fetch_price(appid, hash_name, currency_code):
-  url = (
-    "https://steamcommunity.com/market/priceoverview/"
-    f"?appid={appid}&market_hash_name={hash_name}"
-    f"&currency={currency_code}&format=json"
-  )
+  base_url = "https://steamcommunity.com/market/priceoverview/"
+
+  # пробуем несколько вариантов currency:
+  # 1) та, что выбрана в настройках
+  # 2) USD (1)
+  # 3) RUB (5) — на всякий случай
+  candidates = []
+
+  if currency_code not in candidates:
+    candidates.append(currency_code)
+  for alt in (1, 5):
+    if alt not in candidates:
+      candidates.append(alt)
 
   async with client.ClientSession() as session:
-    async with session.get(url) as r:
-      j = await r.json()
+    for cur in candidates:
+      params = {
+        "appid": appid,
+        "market_hash_name": hash_name,
+        "format": "json"
+      }
+      if cur is not None:
+        params["currency"] = cur
 
-  if not j or not j.get("success"):
-    return None
+      try:
+        async with session.get(base_url, params=params) as r:
+          text = await r.text()
+      except Exception as e:
+        print("price fetch error (request):", e)
+        continue
 
-  price_str = j.get("lowest_price") or j.get("median_price")
-  if not price_str:
-    return None
+      try:
+        data = json.loads(text)
+      except Exception as e:
+        # бывает, что Steam отдаёт HTML (капча / ошибка)
+        print("price fetch error (json):", e, "body:", text[:200])
+        continue
 
-  cleaned = (
-    price_str
-      .replace(" ", "")
-      .replace("\xa0", "")
-      .replace(",", ".")
-  )
+      if not data.get("success"):
+        print("price fetch not success:", data)
+        continue
 
-  digits = "".join(ch for ch in cleaned if ch.isdigit() or ch == ".")
-  try:
-    return float(digits)
-  except Exception:
-    return None
+      price_str = data.get("lowest_price") or data.get("median_price")
+      if not price_str:
+        print("price fetch no price:", data)
+        continue
+
+      cleaned = (
+        price_str
+          .replace(" ", "")
+          .replace("\xa0", "")
+          .replace(",", ".")
+      )
+
+      digits = "".join(ch for ch in cleaned if ch.isdigit() or ch == ".")
+      try:
+        price_val = float(digits)
+        return price_val
+      except Exception as e:
+        print("price parse error:", e, "from:", price_str, "digits:", digits)
+        continue
+
+  # если все попытки провалились
+  return None
+
 
 
 def make_item_id(appid, hash_name, user_token):
