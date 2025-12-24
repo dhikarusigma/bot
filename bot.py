@@ -4,7 +4,7 @@ import json
 import time
 import secrets
 import hashlib
-
+from urllib.parse import urlencode
 from aiohttp import web, client
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
@@ -75,46 +75,56 @@ def now_sec():
 
 
 async def fetch_price(appid, hash_name, currency_code):
-    """
-    Возвращает float-цену в *той валюте, которая выбрана в settings*,
-    либо None, если Steam не дал цену (капча/ошибка/нет данных).
-    """
-    url = (
-        "https://steamcommunity.com/market/priceoverview/"
-        f"?appid={appid}&market_hash_name={hash_name}"
-        f"&currency={currency_code}&format=json"
-    )
+  """
+  Возвращает float-цену в выбранной валюте,
+  либо None, если Steam не дал цену.
+  """
+  params = {
+    "appid": str(appid),
+    "market_hash_name": hash_name,
+    "currency": str(currency_code),
+    "format": "json"
+  }
 
-    async with client.ClientSession() as session:
-        try:
-            async with session.get(url) as r:
-                data = await r.json()
-        except Exception as e:
-            print("price fetch error:", e)
-            return None
+  url = (
+    "https://steamcommunity.com/market/priceoverview/?" +
+    urlencode(params)
+  )
 
-    if not data.get("success"):
-        print("price fetch not success:", data)
-        return None
-
-    price_str = data.get("lowest_price") or data.get("median_price")
-    if not price_str:
-        print("price fetch no price:", data)
-        return None
-
-    cleaned = (
-        price_str
-          .replace(" ", "")
-          .replace("\xa0", "")
-          .replace(",", ".")
-    )
-    digits = "".join(ch for ch in cleaned if ch.isdigit() or ch == ".")
+  async with client.ClientSession() as session:
     try:
-        return float(digits)
+      async with session.get(url) as r:
+        if r.status != 200:
+          print("price fetch bad status:", r.status)
+          return None
+        data = await r.json()
     except Exception as e:
-        print("price parse error:", e, "src:", price_str)
-        return None
+      print("price fetch error:", e)
+      return None
 
+  if not data.get("success"):
+    print("price fetch not success:", data)
+    return None
+
+  price_str = data.get("lowest_price") or data.get("median_price")
+  if not price_str:
+    print("price fetch no price:", data)
+    return None
+
+  cleaned = (
+    price_str
+      .replace(" ", "")
+      .replace("\xa0", "")
+      .replace(",", ".")
+  )
+
+  digits = "".join(ch for ch in cleaned if ch.isdigit() or ch == ".")
+
+  try:
+    return float(digits)
+  except Exception as e:
+    print("price parse error:", e, "src:", price_str)
+    return None
 
 
 
@@ -388,9 +398,11 @@ async def api_use(request):
 async def api_track(request):
   data = await request.json()
   token = data.get("token")
-  appid = data.get("appid")
+  appid_raw = data.get("appid")
   hash_name = data.get("hash_name")
-  target_price = data.get("target_price")
+  target_raw = data.get("target_price")
+  direction_raw = (data.get("direction") or "").strip()
+
 
   async with lock:
     user = find_user_by_token(token)
@@ -405,12 +417,13 @@ async def api_track(request):
     return web.json_response({ "ok": False, "error": "bad_input" })
 
   current_price = await fetch_price(appid, hash_name, settings["currency_code"])
-  if current_price is None:
-    current_price = 0.0
+if current_price is None:
+  current_price = 0.0
 
-  direction = "buy"
-  if target_price > current_price:
-    direction = "sell"
+direction = "buy"
+if target_price > current_price:
+  direction = "sell"
+
 
   item_id = make_item_id(appid, hash_name, user_token)
 
