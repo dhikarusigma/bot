@@ -86,10 +86,7 @@ async def fetch_price(appid, hash_name, currency_code):
     "format": "json"
   }
 
-  url = (
-    "https://steamcommunity.com/market/priceoverview/?" +
-    urlencode(params)
-  )
+  url = "https://steamcommunity.com/market/priceoverview/?" + urlencode(params)
 
   async with client.ClientSession() as session:
     try:
@@ -397,12 +394,12 @@ async def api_use(request):
 
 async def api_track(request):
   data = await request.json()
+
   token = data.get("token")
   appid_raw = data.get("appid")
-  hash_name = data.get("hash_name")
+  hash_name = (data.get("hash_name") or "").strip()
   target_raw = data.get("target_price")
-  direction_raw = (data.get("direction") or "").strip()
-
+  direction_raw = (str(data.get("direction") or "")).strip().lower()
 
   async with lock:
     user = find_user_by_token(token)
@@ -413,17 +410,33 @@ async def api_track(request):
     chat_id = user.get("tg_chat_id")
     user_token = user["token"]
 
-  if not appid or not hash_name or not target_price:
+  # приведение типов
+  try:
+    appid = int(appid_raw)
+  except (TypeError, ValueError):
+    return web.json_response({ "ok": False, "error": "bad_appid" })
+
+  try:
+    target_price = float(target_raw)
+  except (TypeError, ValueError):
+    return web.json_response({ "ok": False, "error": "bad_price" })
+
+  if not hash_name or target_price <= 0:
     return web.json_response({ "ok": False, "error": "bad_input" })
 
+  # цена из Steam
   current_price = await fetch_price(appid, hash_name, settings["currency_code"])
-if current_price is None:
-  current_price = 0.0
+  price_known = current_price is not None
+  if current_price is None:
+    current_price = 0.0
 
-direction = "buy"
-if target_price > current_price:
-  direction = "sell"
-
+  # режим: либо явный, либо авто
+  if direction_raw in ("buy", "sell"):
+    direction = direction_raw
+  else:
+    direction = "buy"
+    if price_known and target_price > current_price:
+      direction = "sell"
 
   item_id = make_item_id(appid, hash_name, user_token)
 
@@ -438,6 +451,8 @@ if target_price > current_price:
       exist["target_price"] = target_price
       exist["direction"] = direction
       exist["enabled"] = True
+      exist["last_price"] = current_price
+      exist["last_checked_at"] = now_sec()
     else:
       items.append({
         "id": item_id,
