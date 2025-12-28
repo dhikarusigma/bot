@@ -19,8 +19,9 @@ if not bot_token:
 dp = Dispatcher()
 tg_bot = Bot(token=bot_token)
 
-users_path = "users.json"
-items_path = "items.json"
+base_dir = os.path.dirname(os.path.abspath(__file__))
+users_path = os.path.join(base_dir, "users.json")
+items_path = os.path.join(base_dir, "items.json")
 
 lock = asyncio.Lock()
 
@@ -87,6 +88,7 @@ async def fetch_price(appid, hash_name, currency_code):
   }
 
   url = "https://steamcommunity.com/market/priceoverview/?" + urlencode(params)
+  print("price fetch url:", url)
 
   async with client.ClientSession() as session:
     try:
@@ -98,6 +100,8 @@ async def fetch_price(appid, hash_name, currency_code):
     except Exception as e:
       print("price fetch error:", e)
       return None
+
+  print("price fetch raw data:", data)
 
   if not data.get("success"):
     print("price fetch not success:", data)
@@ -122,6 +126,7 @@ async def fetch_price(appid, hash_name, currency_code):
   except Exception as e:
     print("price parse error:", e, "src:", price_str)
     return None
+
 
 
 
@@ -271,6 +276,7 @@ async def api_register(request):
     save_json(users_path, users)
 
   return web.json_response({ "ok": True })
+
 
 
 # login: tg_username + password
@@ -430,13 +436,13 @@ async def api_track(request):
   if current_price is None:
     current_price = 0.0
 
-  # режим: либо явный, либо авто
   if direction_raw in ("buy", "sell"):
     direction = direction_raw
   else:
     direction = "buy"
     if price_known and target_price > current_price:
       direction = "sell"
+
 
   item_id = make_item_id(appid, hash_name, user_token)
 
