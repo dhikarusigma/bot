@@ -4,7 +4,8 @@ import json
 import time
 import secrets
 import hashlib
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
+import re
 from aiohttp import web, client
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
@@ -28,17 +29,30 @@ lock = asyncio.Lock()
 
 def load_json(path, default):
   if not os.path.exists(path):
+    save_json(path, default)
     return default
   try:
     with open(path, "r", encoding="utf-8") as f:
       return json.load(f)
   except Exception:
+    # если файл битый — сохраним backup и создадим новый
+    try:
+      bad_path = path + f".bad-{int(time.time())}"
+      os.replace(path, bad_path)
+    except Exception:
+      pass
+    save_json(path, default)
     return default
 
 
 def save_json(path, data):
-  with open(path, "w", encoding="utf-8") as f:
+  tmp_path = path + ".tmp"
+  with open(tmp_path, "w", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
+    f.flush()
+    os.fsync(f.fileno())
+  os.replace(tmp_path, path)
+
 
 
 users = load_json(users_path, [])
@@ -75,6 +89,61 @@ def now_sec():
   return int(time.time())
 
 
+steam_timeout = client.ClientTimeout(total=10)
+steam_base_headers = {
+  "user-agent": "steam-track-n-buy/1.0",
+  "accept": "application/json,text/plain,*/*",
+  "accept-language": "en-US,en;q=0.9"
+}
+steam_session = None
+
+
+async def get_steam_session():
+  global steam_session
+  if steam_session is None or steam_session.closed:
+    steam_session = client.ClientSession(timeout=steam_timeout, headers=steam_base_headers)
+  return steam_session
+
+
+def parse_price_str(price_str):
+  s = (
+    str(price_str)
+      .replace(" ", "")
+      .replace("\xa0", "")
+  )
+  s = "".join(ch for ch in s if ch.isdigit() or ch in ".,")
+  if not s:
+    return None
+
+  last_dot = s.rfind(".")
+  last_comma = s.rfind(",")
+
+  if last_dot != -1 and last_comma != -1:
+    if last_comma > last_dot:
+      dec = ","
+      thou = "."
+    else:
+      dec = "."
+      thou = ","
+    s = s.replace(thou, "")
+    s = s.replace(dec, ".")
+  else:
+    sep = "." if last_dot != -1 else ("," if last_comma != -1 else None)
+    if sep:
+      parts = s.split(sep)
+      if len(parts) > 2:
+        decimal = parts[-1]
+        int_part = "".join(parts[:-1])
+        s = int_part + "." + decimal
+      else:
+        s = s.replace(sep, ".")
+
+  try:
+    return float(s)
+  except Exception:
+    return None
+
+
 async def fetch_price(appid, hash_name, currency_code):
   """
   Возвращает float-цену в выбранной валюте,
@@ -87,47 +156,65 @@ async def fetch_price(appid, hash_name, currency_code):
     "format": "json"
   }
 
-  url = "https://steamcommunity.com/market/priceoverview/?" + urlencode(params)
-  print("price fetch url:", url)
-
-  async with client.ClientSession() as session:
-    try:
-      async with session.get(url) as r:
-        if r.status != 200:
-          print("price fetch bad status:", r.status)
-          return None
-        data = await r.json()
-    except Exception as e:
-      print("price fetch error:", e)
-      return None
-
-  print("price fetch raw data:", data)
-
-  if not data.get("success"):
-    print("price fetch not success:", data)
-    return None
-
-  price_str = data.get("lowest_price") or data.get("median_price")
-  if not price_str:
-    print("price fetch no price:", data)
-    return None
-
-  cleaned = (
-    price_str
-      .replace(" ", "")
-      .replace("\xa0", "")
-      .replace(",", ".")
+  query = urlencode(params, quote_via=quote, safe="")
+  url = "https://steamcommunity.com/market/priceoverview/?" + query
+  referer = (
+    "https://steamcommunity.com/market/listings/"
+    + str(appid)
+    + "/"
+    + quote(hash_name, safe="")
   )
 
-  digits = "".join(ch for ch in cleaned if ch.isdigit() or ch == ".")
+  print("price fetch url:", url)
 
-  try:
-    return float(digits)
-  except Exception as e:
-    print("price parse error:", e, "src:", price_str)
-    return None
+  for attempt in range(3):
+    try:
+      session = await get_steam_session()
+      async with session.get(url, headers={ "referer": referer }) as r:
+        body = await r.text()
 
+        if r.status == 429:
+          print("price fetch rate limited (429), attempt:", attempt + 1)
+          print("price fetch body:", body[:300])
+          await asyncio.sleep(1 + attempt)
+          continue
 
+        if r.status != 200:
+          print("price fetch bad status:", r.status)
+          print("price fetch body:", body[:300])
+          return None
+
+        try:
+          data = json.loads(body)
+        except Exception as e:
+          print("price fetch json parse error:", e)
+          print("price fetch body:", body[:300])
+          return None
+
+    except Exception as e:
+      print("price fetch error:", e, "attempt:", attempt + 1)
+      await asyncio.sleep(0.5 + attempt)
+      continue
+
+    print("price fetch raw data:", data)
+
+    if not data.get("success"):
+      print("price fetch not success:", data)
+      return None
+
+    price_str = data.get("lowest_price") or data.get("median_price")
+    if not price_str:
+      print("price fetch no price:", data)
+      return None
+
+    price = parse_price_str(price_str)
+    if price is None:
+      print("price parse error src:", price_str)
+      return None
+
+    return price
+
+  return None
 
 
 def make_item_id(appid, hash_name, user_token):
@@ -430,21 +517,16 @@ async def api_track(request):
   if not hash_name or target_price <= 0:
     return web.json_response({ "ok": False, "error": "bad_input" })
 
-  # цена из Steam
+  if direction_raw not in ("buy", "sell"):
+    return web.json_response({ "ok": False, "error": "bad_direction" })
+
+  # цена из Steam (может быть None, если Steam не дал цену)
   current_price = await fetch_price(appid, hash_name, settings["currency_code"])
   price_known = current_price is not None
-  if current_price is None:
-    current_price = 0.0
 
-  if direction_raw in ("buy", "sell"):
-    direction = direction_raw
-  else:
-    direction = "buy"
-    if price_known and target_price > current_price:
-      direction = "sell"
-
-
+  direction = direction_raw
   item_id = make_item_id(appid, hash_name, user_token)
+  now = now_sec()
 
   async with lock:
     exist = None
@@ -458,7 +540,7 @@ async def api_track(request):
       exist["direction"] = direction
       exist["enabled"] = True
       exist["last_price"] = current_price
-      exist["last_checked_at"] = now_sec()
+      exist["last_checked_at"] = now
     else:
       items.append({
         "id": item_id,
@@ -469,7 +551,7 @@ async def api_track(request):
         "direction": direction,
         "enabled": True,
         "last_price": current_price,
-        "last_checked_at": now_sec(),
+        "last_checked_at": now,
         "last_notified_at": 0
       })
 
@@ -477,17 +559,29 @@ async def api_track(request):
 
   if chat_id:
     cur = settings["currency_label"]
-    advise = (
-      "target is below current price — I will wait for the price to drop."
-      if direction == "buy"
-      else "target is above current price — I will wait for the price to rise."
-    )
+    current_price_str = "?" if current_price is None else f"{current_price}"
+
+    if direction == "buy":
+      if not price_known:
+        advise = "price is unknown — Steam didn't return a price yet."
+      elif current_price > target_price:
+        advise = "target is below current price — I will wait for the price to drop."
+      else:
+        advise = "target already reached — you may buy now."
+    else:
+      if not price_known:
+        advise = "price is unknown — Steam didn't return a price yet."
+      elif current_price < target_price:
+        advise = "target is above current price — I will wait for the price to rise."
+      else:
+        advise = "target already reached — you may sell now."
 
     text = (
       "✅ Added to tracking:\n"
       f"[{hash_name}]\n"
-      f"current price: {current_price} {cur}\n"
+      f"current price: {current_price_str} {cur}\n"
       f"target: {target_price} {cur}\n"
+      f"mode: {direction}\n"
       f"{advise}"
     )
     await tg_bot.send_message(chat_id, text)
@@ -535,10 +629,6 @@ async def polling_loop():
       local_users = list(users)
       local_items = list(items)
 
-    interval_min = 10
-    for u in local_users:
-      interval_min = min(interval_min, u["settings"].get("interval_min", 10))
-
     now = now_sec()
 
     for it in local_items:
@@ -556,7 +646,7 @@ async def polling_loop():
 
       settings = user["settings"]
 
-      if now - it.get("last_checked_at", 0) < interval_min * 60:
+      if now - it.get("last_checked_at", 0) < settings.get("interval_min", 10) * 60:
         continue
 
       price_now = await fetch_price(
