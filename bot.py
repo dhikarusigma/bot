@@ -4,6 +4,8 @@ import json
 import time
 import secrets
 import hashlib
+import base64
+import zlib
 from urllib.parse import urlencode, quote
 import re
 from aiohttp import web, client
@@ -14,35 +16,73 @@ from aiogram.filters import CommandStart, Command
 bot_token = os.getenv("bot_token")
 bot_username = os.getenv("bot_username", "")
 
+# Render.com persistence workaround
+# При запуске загружаем из ENV, при изменении - сохраняем в файл
+# Для реальной персистентности нужен Render Disk или внешняя БД
+USERS_BACKUP_ENV = os.getenv("USERS_BACKUP", "")
+ITEMS_BACKUP_ENV = os.getenv("ITEMS_BACKUP", "")
+
 if not bot_token:
   raise RuntimeError("bot_token is not set")
 
 dp = Dispatcher()
 tg_bot = Bot(token=bot_token)
 
-base_dir = os.path.dirname(os.path.abspath(__file__))
-users_path = os.path.join(base_dir, "users.json")
-items_path = os.path.join(base_dir, "items.json")
+data_dir = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+users_path = os.path.join(data_dir, "users.json")
+items_path = os.path.join(data_dir, "items.json")
 
 lock = asyncio.Lock()
 
 
-def load_json(path, default):
-  if not os.path.exists(path):
-    save_json(path, default)
-    return default
+def decode_backup(encoded_str):
+  """Декодирует данные из base64+zlib"""
+  if not encoded_str:
+    return None
   try:
-    with open(path, "r", encoding="utf-8") as f:
-      return json.load(f)
-  except Exception:
-    # если файл битый — сохраним backup и создадим новый
+    compressed = base64.b64decode(encoded_str)
+    json_bytes = zlib.decompress(compressed)
+    return json.loads(json_bytes.decode("utf-8"))
+  except Exception as e:
+    print(f"[decode_backup] failed: {e}")
+    return None
+
+
+def encode_backup(data):
+  """Кодирует данные в base64+zlib для ENV"""
+  try:
+    json_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    compressed = zlib.compress(json_bytes, level=9)
+    return base64.b64encode(compressed).decode("ascii")
+  except Exception as e:
+    print(f"[encode_backup] failed: {e}")
+    return ""
+
+
+def load_json(path, default, env_backup=""):
+  # Сначала пробуем загрузить из файла
+  if os.path.exists(path):
     try:
-      bad_path = path + f".bad-{int(time.time())}"
-      os.replace(path, bad_path)
-    except Exception:
-      pass
-    save_json(path, default)
-    return default
+      with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        if data:  # Если есть данные в файле
+          print(f"[load_json] loaded from file: {path}, items={len(data)}")
+          return data
+    except Exception as e:
+      print(f"[load_json] file read error: {e}")
+  
+  # Если файл пустой/нет, пробуем из ENV backup
+  if env_backup:
+    backup_data = decode_backup(env_backup)
+    if backup_data:
+      print(f"[load_json] restored from ENV backup, items={len(backup_data)}")
+      save_json(path, backup_data)  # Сохраняем в файл
+      return backup_data
+  
+  # Создаём пустой файл
+  print(f"[load_json] creating new: {path}")
+  save_json(path, default)
+  return default
 
 
 def save_json(path, data):
@@ -51,31 +91,51 @@ def save_json(path, data):
   try:
     payload = json.dumps(data, ensure_ascii=False, indent=2)
 
-    print("save_json begin")
-    print("save_json path:", path)
-    print("save_json tmp:", tmp_path)
-    print("save_json bytes:", len(payload))
+    print(f"[save_json] path={path}")
+    print(f"[save_json] data_len={len(data) if isinstance(data, list) else 'not list'}")
+    print(f"[save_json] payload_bytes={len(payload)}")
+
+    # Проверяем директорию
+    dir_path = os.path.dirname(path)
+    if dir_path and not os.path.exists(dir_path):
+      os.makedirs(dir_path, exist_ok=True)
+      print(f"[save_json] created directory: {dir_path}")
 
     with open(tmp_path, "w", encoding="utf-8") as f:
       f.write(payload)
       f.flush()
       os.fsync(f.fileno())
 
+    print(f"[save_json] tmp file written: {tmp_path}")
+
     os.replace(tmp_path, path)
 
-    size = os.path.getsize(path)
-    print("save_json ok")
-    print("save_json size:", size)
+    # Верифицируем запись
+    if os.path.exists(path):
+      size = os.path.getsize(path)
+      print(f"[save_json] OK, final size={size}")
+      
+      # Дополнительная проверка: читаем обратно
+      with open(path, "r", encoding="utf-8") as f:
+        verify = json.load(f)
+      print(f"[save_json] verified, items={len(verify) if isinstance(verify, list) else 'not list'}")
+    else:
+      print(f"[save_json] WARNING: file not found after replace!")
 
   except Exception as e:
-    print("save_json fail:", repr(e))
+    print(f"[save_json] FAIL: {repr(e)}")
+    import traceback
+    traceback.print_exc()
     raise
 
 
 
 
-users = load_json(users_path, [])
-items = load_json(items_path, [])
+users = load_json(users_path, [], USERS_BACKUP_ENV)
+items = load_json(items_path, [], ITEMS_BACKUP_ENV)
+
+print(f"[startup] users loaded: {len(users)}")
+print(f"[startup] items loaded: {len(items)}")
 
 
 def hash_password(password, salt):
@@ -391,6 +451,31 @@ async def list_items_handler(message: types.Message):
 
 async def healthz(request):
   return web.Response(text="ok")
+
+
+async def api_backup(request):
+  """
+  Возвращает закодированные данные для сохранения в ENV.
+  Защищён секретным ключом.
+  """
+  secret = request.query.get("secret")
+  expected = os.getenv("BACKUP_SECRET", "")
+  
+  if not expected or secret != expected:
+    return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+  
+  async with lock:
+    users_backup = encode_backup(users)
+    items_backup = encode_backup(items)
+  
+  return web.json_response({
+    "ok": True,
+    "users_count": len(users),
+    "items_count": len(items),
+    "USERS_BACKUP": users_backup,
+    "ITEMS_BACKUP": items_backup,
+    "instruction": "Add these values to Render Environment Variables to persist data across restarts"
+  })
 
 
 # registration: tg_username + password
@@ -816,6 +901,7 @@ async def main():
   app.router.add_post("/api/use", api_use)
   app.router.add_post("/api/track", api_track)
   app.router.add_post("/api/untrack", api_untrack)
+  app.router.add_get("/api/backup", api_backup)
 
   runner = web.AppRunner(app)
   await runner.setup()
