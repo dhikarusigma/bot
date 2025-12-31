@@ -47,11 +47,30 @@ def load_json(path, default):
 
 def save_json(path, data):
   tmp_path = path + ".tmp"
-  with open(tmp_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.flush()
-    os.fsync(f.fileno())
-  os.replace(tmp_path, path)
+
+  try:
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+    print("save_json begin")
+    print("save_json path:", path)
+    print("save_json tmp:", tmp_path)
+    print("save_json bytes:", len(payload))
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      f.write(payload)
+      f.flush()
+      os.fsync(f.fileno())
+
+    os.replace(tmp_path, path)
+
+    size = os.path.getsize(path)
+    print("save_json ok")
+    print("save_json size:", size)
+
+  except Exception as e:
+    print("save_json fail:", repr(e))
+    raise
+
 
 
 
@@ -408,7 +427,14 @@ async def api_register(request):
       }
     })
 
+    print("api_register before save")
+    print("users_path:", users_path)
+    print("users_len:", len(users))
+
     save_json(users_path, users)
+
+    print("api_register after save")
+    print("users_len:", len(users))
 
   return web.json_response({ "ok": True })
 
