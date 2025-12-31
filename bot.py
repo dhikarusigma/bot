@@ -143,12 +143,47 @@ def parse_price_str(price_str):
   except Exception:
     return None
 
+def parse_price(price_text):
+  if price_text is None:
+    return None
+
+  text = str(price_text)
+  text = text.replace("\xa0", " ")
+  text = text.strip()
+
+  if text == "":
+    return None
+
+  m = re.search(r"\d[\d\s\.,]*\d", text)
+  if not m:
+    return None
+
+  cleaned = m.group(0)
+  cleaned = cleaned.replace(" ", "")
+
+  has_comma = "," in cleaned
+  has_dot = "." in cleaned
+
+  if has_comma and has_dot:
+    last_comma = cleaned.rfind(",")
+    last_dot = cleaned.rfind(".")
+
+    if last_comma > last_dot:
+      cleaned = cleaned.replace(".", "")
+      cleaned = cleaned.replace(",", ".")
+    else:
+      cleaned = cleaned.replace(",", "")
+
+  elif has_comma and not has_dot:
+    cleaned = cleaned.replace(",", ".")
+
+  try:
+    return float(cleaned)
+  except Exception:
+    return None
+
 
 async def fetch_price(appid, hash_name, currency_code):
-  """
-  Возвращает float-цену в выбранной валюте,
-  либо None, если Steam не дал цену.
-  """
   params = {
     "appid": str(appid),
     "market_hash_name": hash_name,
@@ -156,63 +191,76 @@ async def fetch_price(appid, hash_name, currency_code):
     "format": "json"
   }
 
-  query = urlencode(params, quote_via=quote, safe="")
-  url = "https://steamcommunity.com/market/priceoverview/?" + query
-  referer = (
-    "https://steamcommunity.com/market/listings/"
-    + str(appid)
-    + "/"
-    + quote(hash_name, safe="")
+  url = "https://steamcommunity.com/market/priceoverview/?" + urlencode(
+    params,
+    quote_via=quote,
+    safe=""
   )
-
   print("price fetch url:", url)
 
-  for attempt in range(3):
-    try:
-      session = await get_steam_session()
-      async with session.get(url, headers={ "referer": referer }) as r:
-        body = await r.text()
+  headers = {
+    "user-agent": "steam-track-n-buy/1.0",
+    "accept": "application/json,text/plain,*/*",
+    "accept-language": "en-US,en;q=0.9,ru;q=0.8",
+    "referer": "https://steamcommunity.com/market/"
+  }
 
-        if r.status == 429:
-          print("price fetch rate limited (429), attempt:", attempt + 1)
-          print("price fetch body:", body[:300])
-          await asyncio.sleep(1 + attempt)
+  timeout = client.ClientTimeout(total=12)
+
+  async with client.ClientSession(timeout=timeout) as session:
+    for attempt in range(3):
+      try:
+        async with session.get(url, headers=headers) as r:
+          body_text = await r.text()
+
+          if r.status == 429:
+            if attempt < 2:
+              wait_sec = 1 + attempt
+              print("price fetch rate limited:", r.status, "wait:", wait_sec)
+              await asyncio.sleep(wait_sec)
+              continue
+
+          if r.status != 200:
+            print("price fetch bad status:", r.status)
+            print("price fetch body:", body_text[:300])
+            return None
+
+      except Exception as e:
+        if attempt < 2:
+          wait_sec = 1 + attempt
+          print("price fetch error retry:", e, "wait:", wait_sec)
+          await asyncio.sleep(wait_sec)
           continue
 
-        if r.status != 200:
-          print("price fetch bad status:", r.status)
-          print("price fetch body:", body[:300])
-          return None
+        print("price fetch error:", e)
+        return None
 
-        try:
-          data = json.loads(body)
-        except Exception as e:
-          print("price fetch json parse error:", e)
-          print("price fetch body:", body[:300])
-          return None
+      try:
+        data = json.loads(body_text)
+      except Exception as e:
+        print("price fetch json parse error:", e)
+        print("price fetch body:", body_text[:300])
+        return None
 
-    except Exception as e:
-      print("price fetch error:", e, "attempt:", attempt + 1)
-      await asyncio.sleep(0.5 + attempt)
-      continue
+      print("price fetch raw data:", data)
 
-    print("price fetch raw data:", data)
+      if not isinstance(data, dict):
+        print("price fetch unexpected type:", type(data))
+        return None
 
-    if not data.get("success"):
-      print("price fetch not success:", data)
-      return None
+      if not data.get("success"):
+        print("price fetch not success:", data)
+        return None
 
-    price_str = data.get("lowest_price") or data.get("median_price")
-    if not price_str:
-      print("price fetch no price:", data)
-      return None
+      price_text = data.get("lowest_price") or data.get("median_price")
+      print("price fetch price_text:", price_text)
 
-    price = parse_price_str(price_str)
-    if price is None:
-      print("price parse error src:", price_str)
-      return None
+      price_value = parse_price(price_text)
+      if price_value is None:
+        print("price parse failed:", price_text)
+        return None
 
-    return price
+      return price_value
 
   return None
 
@@ -503,7 +551,6 @@ async def api_track(request):
     chat_id = user.get("tg_chat_id")
     user_token = user["token"]
 
-  # приведение типов
   try:
     appid = int(appid_raw)
   except (TypeError, ValueError):
@@ -520,13 +567,12 @@ async def api_track(request):
   if direction_raw not in ("buy", "sell"):
     return web.json_response({ "ok": False, "error": "bad_direction" })
 
-  # цена из Steam (может быть None, если Steam не дал цену)
-  current_price = await fetch_price(appid, hash_name, settings["currency_code"])
-  price_known = current_price is not None
-
   direction = direction_raw
-  item_id = make_item_id(appid, hash_name, user_token)
   now = now_sec()
+
+  current_price = await fetch_price(appid, hash_name, settings["currency_code"])
+
+  item_id = make_item_id(appid, hash_name, user_token)
 
   async with lock:
     exist = None
@@ -559,38 +605,44 @@ async def api_track(request):
 
   if chat_id:
     cur = settings["currency_label"]
-    current_price_str = "?" if current_price is None else f"{current_price}"
 
-    if direction == "buy":
-      if not price_known:
-        advise = "price is unknown — Steam didn't return a price yet."
-      elif current_price > target_price:
-        advise = "target is below current price — I will wait for the price to drop."
-      else:
-        advise = "target already reached — you may buy now."
+    if current_price is None:
+      current_price_str = "?"
+      advise = "price is unknown — Steam didn't return a price yet."
     else:
-      if not price_known:
-        advise = "price is unknown — Steam didn't return a price yet."
-      elif current_price < target_price:
-        advise = "target is above current price — I will wait for the price to rise."
+      current_price_str = f"{current_price} {cur}"
+
+      if direction == "buy":
+        if current_price > target_price:
+          advise = "target is below current price — I will wait for the price to drop."
+        else:
+          advise = "target already reached — you may buy now."
       else:
-        advise = "target already reached — you may sell now."
+        if current_price < target_price:
+          advise = "target is above current price — I will wait for the price to rise."
+        else:
+          advise = "target already reached — you may sell now."
 
     text = (
       "✅ Added to tracking:\n"
       f"[{hash_name}]\n"
-      f"current price: {current_price_str} {cur}\n"
+      f"current price: {current_price_str}\n"
       f"target: {target_price} {cur}\n"
       f"mode: {direction}\n"
       f"{advise}"
     )
-    await tg_bot.send_message(chat_id, text)
+
+    try:
+      await tg_bot.send_message(chat_id, text)
+    except Exception as e:
+      print("tg send error:", e)
 
   return web.json_response({
     "ok": True,
     "current_price": current_price,
     "direction": direction
   })
+
 
 
 async def api_untrack(request):
@@ -626,8 +678,19 @@ async def polling_loop():
     await asyncio.sleep(3)
 
     async with lock:
-      local_users = list(users)
-      local_items = list(items)
+      local_users = [
+        {
+          **u,
+          "settings": dict(u.get("settings") or {})
+        }
+        for u in users
+      ]
+
+      local_items = [dict(it) for it in items]
+
+    token_to_user = {}
+    for u in local_users:
+      token_to_user[u.get("token")] = u
 
     now = now_sec()
 
@@ -635,24 +698,32 @@ async def polling_loop():
       if not it.get("enabled"):
         continue
 
-      user = None
-      for u in local_users:
-        if u["token"] == it["user_token"]:
-          user = u
-          break
-
-      if not user or not user.get("tg_chat_id"):
+      user = token_to_user.get(it.get("user_token"))
+      if not user:
         continue
 
-      settings = user["settings"]
+      chat_id = user.get("tg_chat_id")
+      if not chat_id:
+        continue
 
-      if now - it.get("last_checked_at", 0) < settings.get("interval_min", 10) * 60:
+      settings = user.get("settings") or {}
+
+      interval_min = settings.get("interval_min", 10)
+      try:
+        interval_min = int(interval_min)
+      except Exception:
+        interval_min = 10
+
+      if interval_min < 1:
+        interval_min = 1
+
+      if now - it.get("last_checked_at", 0) < interval_min * 60:
         continue
 
       price_now = await fetch_price(
         it["appid"],
         it["hash_name"],
-        settings["currency_code"]
+        settings.get("currency_code", 5)
       )
 
       it["last_checked_at"] = now
@@ -665,33 +736,44 @@ async def polling_loop():
       if now - it.get("last_notified_at", 0) < cooldown:
         continue
 
-      direction = it["direction"]
-      target = it["target_price"]
-      cur = settings["currency_label"]
+      direction = it.get("direction")
+      target = it.get("target_price")
+      cur = settings.get("currency_label", "RUB")
 
-      if direction == "buy" and price_now <= target:
-        it["last_notified_at"] = now
-        text = (
-          f"[{it['hash_name']}] is now selling for "
-          f"[{price_now} {cur}] — hurry up and buy!"
-        )
-        await tg_bot.send_message(user["tg_chat_id"], text)
+      if direction == "buy":
+        if price_now <= target:
+          it["last_notified_at"] = now
+          text = (
+            f"[{it['hash_name']}] is now selling for "
+            f"[{price_now} {cur}] — hurry up and buy!"
+          )
+          try:
+            await tg_bot.send_message(chat_id, text)
+          except Exception as e:
+            print("tg send error:", e)
 
-      if direction == "sell" and price_now >= target:
-        it["last_notified_at"] = now
-        text = (
-          f"[{it['hash_name']}] just went up to "
-          f"[{price_now} {cur}] — hurry up and sell!"
-        )
-        await tg_bot.send_message(user["tg_chat_id"], text)
+      if direction == "sell":
+        if price_now >= target:
+          it["last_notified_at"] = now
+          text = (
+            f"[{it['hash_name']}] just went up to "
+            f"[{price_now} {cur}] — hurry up and sell!"
+          )
+          try:
+            await tg_bot.send_message(chat_id, text)
+          except Exception as e:
+            print("tg send error:", e)
 
     async with lock:
       id_to_item = {it["id"]: it for it in local_items}
+
       for i in range(len(items)):
         old_id = items[i]["id"]
         if old_id in id_to_item:
           items[i] = id_to_item[old_id]
+
       save_json(items_path, items)
+
 
 
 async def main():
